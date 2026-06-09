@@ -1,0 +1,11 @@
+# One-time per cluster/environment. All wal-receive resources live here.
+# Per-tenant isolation is by name suffix (UBID), not by namespace.
+# (Switch to namespace-per-tenant only when you need per-tenant RBAC or
+# network policies — at which point this file becomes the template.)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: walg-receivers
+  labels:
+    app.kubernetes.io/name: wal-g-receive
+    app.kubernetes.io/managed-by: ubicloud-control-plane

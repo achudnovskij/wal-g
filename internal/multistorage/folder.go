@@ -452,6 +452,22 @@ func (mf Folder) PutObjectWithContext(ctx context.Context, name string, content 
 	}
 }
 
+// PutObjectIfAbsent forwards a conditional (create-only) write to the first
+// used storage when its backend implements storage.ConditionalPutObjectFolder
+// (e.g. S3 If-None-Match). If the active backend cannot do a conditional write
+// it returns storage.ErrConditionalPutUnsupported so the caller can fall back
+// to a plain PutObject.
+func (mf Folder) PutObjectIfAbsent(ctx context.Context, name string, content io.Reader) error {
+	if len(mf.usedFolders) == 0 {
+		return ErrNoUsedStorages
+	}
+	cond, ok := mf.usedFolders[0].Folder.(storage.ConditionalPutObjectFolder)
+	if !ok {
+		return storage.ErrConditionalPutUnsupported
+	}
+	return cond.PutObjectIfAbsent(ctx, name, content)
+}
+
 // PutObjectToFirst puts the object to the first storage.
 func (mf Folder) PutObjectToFirst(ctx context.Context, name string, content io.Reader) error {
 	if len(mf.usedFolders) == 0 {

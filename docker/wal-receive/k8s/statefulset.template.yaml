@@ -1,0 +1,113 @@
+# Per-tenant StatefulSet. One replica = one receiver pod.
+#
+# Why StatefulSet and not Deployment / bare Pod:
+#  - StatefulSet gives a deterministic pod name (walg-recv-${UBID}-0)
+#    that the control plane can address without querying labels.
+#  - Auto-restart on node failure, unlike a bare Pod.
+#  - Pod identity is stable across rescheduling, so the primary's
+#    pg_stat_replication entry for application_name=walg_sync points
+#    at the same logical receiver even as the pod moves.
+#
+# Storage:
+#  - PoC uses emptyDir.medium="" (node ephemeral). On i8g/i7i nodes
+#    this lands on instance-store NVMe automatically. If the pod
+#    reschedules to a fresh node, the receiver resumes from the
+#    replication slot's restart_lsn — no data loss, just a brief
+#    re-stream window.
+#  - For production, swap to a volumeClaimTemplate bound to a
+#    StorageClass backed by local-volume-provisioner. Keeps partials
+#    across pod-level restarts on the same node.
+
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: walg-recv-${UBID}
+  namespace: walg-receivers
+  labels:
+    app.kubernetes.io/name: wal-g-receive
+    app.kubernetes.io/instance: walg-recv-${UBID}
+    ubicloud.io/postgres-resource-ubid: "${UBID}"
+spec:
+  serviceName: walg-recv-${UBID}   # headless — no Service needed, receiver only makes outbound conns
+  replicas: 1
+  selector:
+    matchLabels:
+      ubicloud.io/postgres-resource-ubid: "${UBID}"
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: wal-g-receive
+        app.kubernetes.io/instance: walg-recv-${UBID}
+        ubicloud.io/postgres-resource-ubid: "${UBID}"
+    spec:
+      # Pin to a node family with instance-store NVMe. Without this,
+      # emptyDir lands on EBS (or whatever the default ephemeral disk
+      # is) and you immediately lose the IOPS profile we measured.
+      nodeSelector:
+        node.kubernetes.io/instance-type: "${NODE_INSTANCE_TYPE}"   # e.g. "i8g.large"
+
+      # Run the entrypoint user (uid 10001) and chown the emptyDir
+      # mount to that group on Pod admission.
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+
+      terminationGracePeriodSeconds: 30
+
+      containers:
+      - name: wal-receive
+        image: "${IMAGE}"                     # e.g. "ghcr.io/<org>/wal-g-receive:0.1.0"
+        imagePullPolicy: "${IMAGE_PULL_POLICY}"   # "IfNotPresent" for tagged releases, "Always" for :dev
+
+        # Container reads all env from the per-tenant ConfigMap.
+        # No literal env: block — keeps the manifest declarative and
+        # the only source of truth is the ConfigMap.
+        envFrom:
+        - configMapRef:
+            name: walg-recv-${UBID}-config
+
+        volumeMounts:
+        - name: tls
+          mountPath: /etc/walg/tls
+          readOnly: true
+        - name: partials
+          mountPath: /var/lib/walg/partials
+
+        resources:
+          requests:
+            cpu: "${CPU_REQUEST}"             # e.g. "500m" — receiver is single-threaded
+            memory: "${MEMORY_REQUEST}"       # e.g. "256Mi" — RSS p95 was 160 MiB in tests
+          limits:
+            cpu: "${CPU_LIMIT}"               # e.g. "2" — bursts during initial catchup
+            memory: "${MEMORY_LIMIT}"         # e.g. "512Mi"
+
+        # Liveness: kernel kills the pod if wal-g exits (PID 1 contract).
+        # This is just a belt-and-suspenders: if wal-g hangs without
+        # crashing, restart after 60s of no progress on the partial dir.
+        livenessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - 'find /var/lib/walg/partials -mmin -1 -type f | grep -q .'
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          failureThreshold: 3
+
+      volumes:
+      - name: tls
+        secret:
+          secretName: walg-recv-${UBID}-secrets
+          items:
+          - key: client.crt
+            path: client.crt
+          - key: client.key
+            path: client.key
+          - key: server-ca.crt
+            path: server-ca.crt
+      # Ephemeral instance-store NVMe via emptyDir on i8g/i7i nodes.
+      # See file-top comment for the production-ready alternative.
+      - name: partials
+        emptyDir:
+          sizeLimit: "${PARTIAL_DIR_SIZE_LIMIT}"   # e.g. "20Gi"

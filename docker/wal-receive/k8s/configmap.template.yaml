@@ -1,0 +1,39 @@
+# Per-tenant ConfigMap — non-secret values the entrypoint reads as env.
+# Control plane renders this once per tenant by substituting ${...}
+# placeholders. UBID is the Postgres resource UBID; it pins every
+# resource for this tenant deterministically.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: walg-recv-${UBID}-config
+  namespace: walg-receivers
+  labels:
+    app.kubernetes.io/name: wal-g-receive
+    ubicloud.io/postgres-resource-ubid: "${UBID}"
+data:
+  # --- Primary connection ---
+  WALG_PRIMARY_HOST: "${PRIMARY_HOST}"
+  WALG_PRIMARY_PORT: "${PRIMARY_PORT}"            # usually "5432"
+  WALG_PRIMARY_USER: "${PRIMARY_USER}"            # e.g. "ubi_replication"
+  WALG_PRIMARY_DB:   "postgres"
+  WALG_APPLICATION_NAME: "walg_sync"               # shown in pg_stat_replication
+
+  # --- Replication slot ---
+  WALG_SLOT_NAME: "${SLOT_NAME}"                  # e.g. "walg_sync"
+
+  # --- Tenant identity ---
+  WALG_TENANT_NAME: "${TENANT_NAME}"              # human-readable, used for logs + push
+
+  # The standby push target is supplied at push-time by the control plane
+  # (POST /v1/dr-catchup); the receiver carries no standby env. For the
+  # autonomous push-on-primary-loss fallback only, set WALG_STANDBY_HOST /
+  # WALG_STANDBY_HTTP_PORT / WALG_STANDBY_TARGET_DIR here.
+
+  # --- Local storage path (matches the volumeMount in the StatefulSet) ---
+  WALG_PARTIAL_DIR: "/var/lib/walg/partials"
+
+  # --- Tuning (image-baked defaults; override per-tenant if needed) ---
+  WALG_WAL_RECEIVE_DRAIN_BATCHING: "true"
+  WALG_WAL_RECEIVE_SKIP_UPLOAD: "true"            # sync-standby mode
+  WALG_WAL_RECEIVE_JANITOR_INTERVAL_SECONDS: "30"
+  WALG_LOG_LEVEL: "NORMAL"

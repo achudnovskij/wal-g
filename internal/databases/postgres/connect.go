@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/pkg/errors"
@@ -45,6 +46,31 @@ func Connect(configOptions ...func(config *pgx.ConnConfig) error) (*pgx.Conn, er
 		}
 	}
 
+	return conn, nil
+}
+
+// ConnectWithTimeout is like Connect but bounds the underlying TCP connect
+// so the caller doesn't block forever when the primary is unreachable
+// (e.g., the primary VM is up but PG is stopped and the firewall silently
+// drops SYN packets). Used by paths — wal-receive's startup and the
+// partial-cleanup janitor — where a 10s ceiling is far more useful than
+// the default 2-min TCP timeout.
+func ConnectWithTimeout(timeout time.Duration, configOptions ...func(config *pgx.ConnConfig) error) (*pgx.Conn, error) {
+	config, err := pgx.ParseConfig("")
+	if err != nil {
+		return nil, errors.Wrap(err, "ConnectWithTimeout: parse env")
+	}
+	for _, option := range configOptions {
+		if err := option(config); err != nil {
+			return nil, err
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	conn, err := pgx.ConnectConfig(ctx, config)
+	if err != nil {
+		return nil, errors.Wrap(err, "ConnectWithTimeout: connection failed")
+	}
 	return conn, nil
 }
 

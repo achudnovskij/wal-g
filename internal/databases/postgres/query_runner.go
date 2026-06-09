@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/pkg/errors"
@@ -441,6 +442,143 @@ func (queryRunner *PgQueryRunner) GetDataDir() (dataDir string, err error) {
 	conn := queryRunner.Connection
 	err = conn.QueryRow(context.TODO(), "show data_directory").Scan(&dataDir)
 	return dataDir, err
+}
+
+// GetCurrentWalLSN reads the primary's pg_current_wal_lsn(). Used by
+// wal-receive to compute how far behind our slot is at startup.
+func (queryRunner *PgQueryRunner) GetCurrentWalLSN() (pglogrepl.LSN, error) {
+	queryRunner.Mu.Lock()
+	defer queryRunner.Mu.Unlock()
+
+	var lsnStr string
+	err := queryRunner.Connection.QueryRow(context.TODO(), "SELECT pg_current_wal_lsn()").Scan(&lsnStr)
+	if err != nil {
+		return 0, errors.Wrap(err, "GetCurrentWalLSN")
+	}
+	return pglogrepl.ParseLSN(lsnStr)
+}
+
+// HasOtherActiveStandby reports whether another physical replication slot
+// (other than excludeSlotName) is currently active. Used by the sole-acker
+// poller to decide whether a peer standby can co-satisfy the sync quorum.
+func (queryRunner *PgQueryRunner) HasOtherActiveStandby(excludeSlotName string) (bool, error) {
+	queryRunner.Mu.Lock()
+	defer queryRunner.Mu.Unlock()
+
+	var count int
+	err := queryRunner.Connection.QueryRow(context.TODO(),
+		"SELECT count(*) FROM pg_replication_slots "+
+			"WHERE slot_type = 'physical' AND active = true AND slot_name <> $1",
+		excludeSlotName).Scan(&count)
+	if err != nil {
+		return false, errors.Wrap(err, "HasOtherActiveStandby")
+	}
+	return count > 0, nil
+}
+
+// OtherActiveStandbyProgress reports, for physical replication peers other than
+// excludeSlotName, whether any such peer is currently active and the furthest
+// LSN any of them has made durable. The progress LSN is the greatest of the
+// peer's slot restart_lsn and (when a matching walsender row exists) its
+// pg_stat_replication flush_lsn — flush_lsn advances on every committed batch
+// the peer acks, whereas restart_lsn only moves when the slot's required-WAL
+// floor rises, so flush_lsn is the freshest "this peer is keeping pace" signal.
+//
+// The sole-acker poller uses this to detect a peer that is active=true (its
+// walsender slot has not yet timed out) but whose acked LSN has frozen — a
+// partitioned/hung standby — without waiting for wal_sender_timeout to mark the
+// slot inactive. progress is only meaningful when active is true.
+func (queryRunner *PgQueryRunner) OtherActiveStandbyProgress(excludeSlotName string) (active bool, progress pglogrepl.LSN, err error) {
+	queryRunner.Mu.Lock()
+	defer queryRunner.Mu.Unlock()
+
+	var count int
+	var lsnStr *string
+	err = queryRunner.Connection.QueryRow(context.TODO(),
+		"SELECT count(*), max(greatest(s.restart_lsn, r.flush_lsn))::text "+
+			"FROM pg_replication_slots s "+
+			"LEFT JOIN pg_stat_replication r ON r.pid = s.active_pid "+
+			"WHERE s.slot_type = 'physical' AND s.active = true AND s.slot_name <> $1",
+		excludeSlotName).Scan(&count, &lsnStr)
+	if err != nil {
+		return false, 0, errors.Wrap(err, "OtherActiveStandbyProgress")
+	}
+	if count == 0 {
+		return false, 0, nil
+	}
+	if lsnStr == nil {
+		// Peer slot active but no restart_lsn/flush_lsn yet (just connected):
+		// treat progress as unknown-but-present (0). The poller's staleness
+		// logic only fires once it has observed a non-zero baseline advance.
+		return true, 0, nil
+	}
+	progress, err = pglogrepl.ParseLSN(*lsnStr)
+	if err != nil {
+		return false, 0, errors.Wrap(err, "OtherActiveStandbyProgress parse lsn")
+	}
+	return true, progress, nil
+}
+
+// MinOtherStandbyFlushLSN returns the smallest restart_lsn (durable flush
+// watermark) among other active physical replication slots, or ok=false if
+// there are none. Used at startup to fast-forward our own slot to WAL another
+// standby already has, without losing durability.
+func (queryRunner *PgQueryRunner) MinOtherStandbyFlushLSN(excludeSlotName string) (lsn pglogrepl.LSN, ok bool, err error) {
+	queryRunner.Mu.Lock()
+	defer queryRunner.Mu.Unlock()
+
+	var lsnStr *string
+	err = queryRunner.Connection.QueryRow(context.TODO(),
+		"SELECT min(restart_lsn)::text FROM pg_replication_slots "+
+			"WHERE slot_type = 'physical' AND active = true "+
+			"AND slot_name <> $1 AND restart_lsn IS NOT NULL",
+		excludeSlotName).Scan(&lsnStr)
+	if err != nil {
+		return 0, false, errors.Wrap(err, "MinOtherStandbyFlushLSN")
+	}
+	if lsnStr == nil {
+		return 0, false, nil
+	}
+	lsn, err = pglogrepl.ParseLSN(*lsnStr)
+	return lsn, err == nil, err
+}
+
+// LastArchivedWALFilename returns pg_stat_archiver.last_archived_wal as a
+// 24-char WAL filename, or ("", false, nil) if the primary has never
+// archived. Used by the wal-receive janitor to decide which local partials
+// can be deleted (anything at or below this segment is safely elsewhere).
+func (queryRunner *PgQueryRunner) LastArchivedWALFilename() (name string, ok bool, err error) {
+	queryRunner.Mu.Lock()
+	defer queryRunner.Mu.Unlock()
+
+	var n *string
+	err = queryRunner.Connection.QueryRow(context.TODO(),
+		"SELECT last_archived_wal FROM pg_stat_archiver").Scan(&n)
+	if err != nil {
+		return "", false, errors.Wrap(err, "LastArchivedWALFilename")
+	}
+	if n == nil || *n == "" {
+		return "", false, nil
+	}
+	return *n, true, nil
+}
+
+// AdvanceReplicationSlot fast-forwards the slot's restart_lsn. Requires the
+// REPLICATION role (which wal-receive already needs) and the slot to be
+// inactive — which is the case between wal-g processes. Returns the LSN the
+// primary actually advanced to (it may snap to a record boundary).
+func (queryRunner *PgQueryRunner) AdvanceReplicationSlot(slotName string, target pglogrepl.LSN) (pglogrepl.LSN, error) {
+	queryRunner.Mu.Lock()
+	defer queryRunner.Mu.Unlock()
+
+	var newLsnStr string
+	err := queryRunner.Connection.QueryRow(context.TODO(),
+		"SELECT end_lsn::text FROM pg_replication_slot_advance($1, $2)",
+		slotName, target.String()).Scan(&newLsnStr)
+	if err != nil {
+		return 0, errors.Wrapf(err, "AdvanceReplicationSlot(%s -> %s)", slotName, target)
+	}
+	return pglogrepl.ParseLSN(newLsnStr)
 }
 
 // GetPhysicalSlotInfo reads information on a physical replication slot

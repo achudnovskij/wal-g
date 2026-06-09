@@ -1,11 +1,13 @@
 package s3
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/base64"
 	"fmt"
 	"io"
+	"net/http"
 	"path"
 	"strings"
 	"time"
@@ -90,6 +92,74 @@ func (folder *Folder) PutObject(name string, content io.Reader) error {
 
 func (folder *Folder) PutObjectWithContext(ctx context.Context, name string, content io.Reader) error {
 	return folder.uploader.upload(ctx, *folder.bucket, folder.path+name, content) //TODO
+}
+
+// PutObjectIfAbsent uploads content only if the object does not already exist,
+// using an S3 conditional write (If-None-Match: *). On a 412 PreconditionFailed
+// (or 409 ConditionalRequestConflict from a concurrent writer) it returns
+// storage.ErrObjectExists. The body is buffered in memory because a conditional
+// PutObject needs a rewindable body and bypasses the multipart manager; the
+// intended callers (WAL segments) are small.
+func (folder *Folder) PutObjectIfAbsent(ctx context.Context, name string, content io.Reader) error {
+	objectPath := folder.path + name
+	body, err := io.ReadAll(content)
+	if err != nil {
+		return errors.Wrapf(err, "failed to buffer object '%s' for conditional put", objectPath)
+	}
+	input := &s3.PutObjectInput{
+		Bucket:       folder.bucket,
+		Key:          aws.String(objectPath),
+		Body:         bytes.NewReader(body),
+		StorageClass: aws.String(folder.uploader.StorageClass),
+	}
+	if folder.uploader.RetentionPeriod != defaultDisabledRetentionPeriod {
+		until := time.Now().Add(time.Second * folder.uploader.RetentionPeriod)
+		input.ObjectLockMode = aws.String(folder.uploader.RetentionMode)
+		input.ObjectLockRetainUntilDate = &until
+	}
+	if folder.uploader.serverSideEncryption != "" {
+		if folder.uploader.SSECustomerKey != "" {
+			input.SSECustomerAlgorithm = aws.String(folder.uploader.serverSideEncryption)
+			input.SSECustomerKey = aws.String(folder.uploader.SSECustomerKey)
+			input.SSECustomerKeyMD5 = aws.String(GetSSECustomerKeyMD5(folder.uploader.SSECustomerKey))
+		} else {
+			input.ServerSideEncryption = aws.String(folder.uploader.serverSideEncryption)
+		}
+		if folder.uploader.SSEKMSKeyID != "" {
+			input.SSEKMSKeyId = aws.String(folder.uploader.SSEKMSKeyID)
+		}
+	}
+	// aws-sdk-go v1.55.7's PutObjectInput has no IfNoneMatch field, so set the
+	// conditional header directly on the built request: this makes the write
+	// create-if-absent (S3 returns 412 PreconditionFailed if the key exists).
+	req, _ := folder.s3API.PutObjectRequest(input)
+	req.SetContext(ctx)
+	req.HTTPRequest.Header.Set("If-None-Match", "*")
+	if err = req.Send(); err != nil {
+		if isAwsPreconditionFailed(err) {
+			return storage.ErrObjectExists
+		}
+		return errors.Wrapf(err, "failed to conditionally put '%s'", objectPath)
+	}
+	return nil
+}
+
+// isAwsPreconditionFailed reports whether err is S3's response to a failed
+// If-None-Match write: 412 PreconditionFailed (object already exists) or 409
+// ConditionalRequestConflict (a concurrent conditional write won the race).
+func isAwsPreconditionFailed(err error) bool {
+	if rf, ok := err.(awserr.RequestFailure); ok {
+		if rf.StatusCode() == http.StatusPreconditionFailed || rf.StatusCode() == http.StatusConflict {
+			return true
+		}
+	}
+	if ae, ok := err.(awserr.Error); ok {
+		switch ae.Code() {
+		case "PreconditionFailed", "ConditionalRequestConflict":
+			return true
+		}
+	}
+	return false
 }
 
 func (folder *Folder) CopyObject(srcPath string, dstPath string) error {

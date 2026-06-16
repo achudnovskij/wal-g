@@ -17,6 +17,14 @@ import (
 )
 
 // WalUploader extends uploader with wal specific functionality.
+//
+// This is the object-store sink the wal-receiver (and `wal-push`) write through. It embeds the
+// generic internal.Uploader (which owns the storage.Folder + compressor + crypter — i.e. the
+// actual "send to S3/GCS/Azure/FS" machinery, backend-agnostic via the storage.Folder interface)
+// and layers on PG-specific extras:
+//   - DeltaFileManager: optional WAL-delta recording for delta backups (off unless configured).
+//   - ArchiveStatus/PGArchiveStatusManager: track which WAL files have been archived (used by the
+//     archive_command path, not strictly by wal-receive).
 type WalUploader struct {
 	internal.Uploader
 	ArchiveStatusManager   asm.ArchiveStatusManager
@@ -49,6 +57,15 @@ func (walUploader *WalUploader) clone() *WalUploader {
 }
 
 // TODO : unit tests
+// UploadWalFile is what HandleWALReceive calls once per WAL segment. `file` is the WalSegment
+// itself (it's an io.Reader over the in-memory buffer) wrapped with its WAL filename.
+//
+// Step 1 (optional): if WAL-delta recording is enabled AND this is a real WAL filename, wrap the
+// reader in a NewWalDeltaRecordingReader — as the bytes stream through to storage it also parses
+// them to record which blocks changed, feeding delta backups. wal-receive normally has delta off,
+// so this is usually a no-op pass-through.
+// Step 2: hand the (possibly wrapped) reader to the embedded base uploader's UploadFile, which does
+// the real work — compress, encrypt, and PUT to the object store (see internal/uploader.go).
 func (walUploader *WalUploader) UploadWalFile(ctx context.Context, file ioextensions.NamedReader) error {
 	var walFileReader io.Reader
 
@@ -65,6 +82,8 @@ func (walUploader *WalUploader) UploadWalFile(ctx context.Context, file ioextens
 		walFileReader = file
 	}
 
+	// Delegate to the generic upload pipeline (compress → encrypt → storage PUT). The destination
+	// name is the WAL filename; the compressor extension (e.g. `.lz4`) is appended inside UploadFile.
 	return walUploader.UploadFile(ctx, ioextensions.NewNamedReaderImpl(walFileReader, file.Name()))
 }
 

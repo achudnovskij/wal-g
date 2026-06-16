@@ -149,15 +149,26 @@ func (uploader *RegularUploader) Clone() Uploader {
 
 // TODO : unit tests
 // UploadFile compresses a file and uploads it.
+//
+// This is the generic wal-g "put one file into object storage" pipeline — the SAME path used by
+// wal-push, base backups, and (via WalUploader.UploadWalFile) the wal-receiver. It is fully
+// backend-agnostic: the actual S3/GCS/Azure/FS write happens behind the storage.Folder interface
+// in Upload() below. The receiver streaming a WalSegment through here is byte-for-byte equivalent
+// to wal-push archiving a WAL file.
 func (uploader *RegularUploader) uploadFile(ctx context.Context, file ioextensions.NamedReader, isExactPath bool) error {
 	filename := file.Name()
 
 	fileReader := file.(io.Reader)
 	if uploader.dataSize != nil {
-		fileReader = utility.NewWithSizeReader(fileReader, uploader.dataSize)
+		fileReader = utility.NewWithSizeReader(fileReader, uploader.dataSize) // bandwidth/size metric.
 	}
+	// STREAMING transform: wrap the source reader so bytes are compressed (lz4/zstd/brotli per
+	// config) and then encrypted (if a crypter is configured) on the fly — nothing is buffered to
+	// a temp file. `compressedFile` is the ciphertext stream that will be PUT to storage.
 	compressedFile := CompressAndEncrypt(fileReader, uploader.Compressor, ConfigureCrypter())
 
+	// Destination object key. Exact path = use the name verbatim (used when the caller already
+	// encodes the final name); otherwise append the compressor's extension, e.g. `...002A.lz4`.
 	dstPath := utility.SanitizePath(filename)
 	if !isExactPath {
 		dstPath = utility.SanitizePath(utility.AddFileExtension(filepath.Base(filename), uploader.Compressor.FileExtension()))
@@ -188,6 +199,10 @@ func (uploader *RegularUploader) Compression() compression.Compressor {
 	return uploader.Compressor
 }
 
+// Upload is the final hop to the object store: it streams `content` (already compressed+encrypted)
+// to the storage backend under `path`. UploadingFolder is a storage.Folder — the single interface
+// every backend (S3, GCS, Azure, Swift, local FS) implements — so PutObjectWithContext is where the
+// receiver's WAL bytes actually become an object in the bucket. Failures are recorded and surfaced.
 func (uploader *RegularUploader) Upload(ctx context.Context, path string, content io.Reader) error {
 	uploader.waitGroup.Add(1)
 	defer uploader.waitGroup.Done()
@@ -196,6 +211,7 @@ func (uploader *RegularUploader) Upload(ctx context.Context, path string, conten
 	if uploader.tarSize != nil {
 		content = utility.NewWithSizeReader(content, uploader.tarSize)
 	}
+	// The actual backend PUT (S3 PutObject / GCS write / Azure block blob / file write).
 	err := uploader.UploadingFolder.PutObjectWithContext(ctx, path, content)
 	if err != nil {
 		statistics.WalgMetrics.UploadedFilesFailedTotal.Inc()

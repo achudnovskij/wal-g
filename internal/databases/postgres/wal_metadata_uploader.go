@@ -171,6 +171,12 @@ func uploadLocalWalMetadata(ctx context.Context, walFilePath string, uploader in
 	return walMetadataUploader.UploadWalMetadata(ctx, walFileName, createdTime, uploader)
 }
 
+// uploadRemoteWalMetadata writes a small `.json` sidecar next to each archived WAL file recording
+// when/how it was produced. The handler calls it right after UploadWalFile for every segment.
+//
+// It is OPT-IN via WALG_UPLOAD_WAL_METADATA: at the "NoMetadata" level (the default) it's a no-op
+// and skips the extra PUT entirely; otherwise it uploads the metadata (here keyed on the upload
+// time, because wal-receive may run on a remote box with no access to the cluster's pg_wal/).
 func uploadRemoteWalMetadata(ctx context.Context, walFileName string, uploader internal.Uploader) error {
 	walMetadataSetting := viper.GetString(conf.UploadWalMetadata)
 	if walMetadataSetting == WalNoMetadataLevel {
